@@ -1,0 +1,17 @@
+{
+  "name": "dew-streaming-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node src/index.js",
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.11.0",
+    "dotenv": "^16.4.5",
+    "hono": "^4.4.0",
+    "mongoose": "^8.7.0",
+    "ws": "^8.18.0"
+  }
+}
