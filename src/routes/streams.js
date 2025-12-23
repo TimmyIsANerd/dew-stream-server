@@ -10,13 +10,17 @@ streams.post('/', async (c) => {
     const body = await c.req.json()
     const { userId, publicStreamName, title } = body || {}
 
+    console.log('📺 [Streams] POST /api/streams:', { userId, publicStreamName, title })
+
     if (!userId || !publicStreamName) {
+      console.log('📺 [Streams] Missing required fields')
       return c.json({ error: 'userId and publicStreamName are required' }, 400)
     }
 
     // Ensure uniqueness for publicStreamName
     const exists = await Stream.findOne({ publicStreamName })
     if (exists) {
+      console.log('📺 [Streams] Stream already exists:', exists._id)
       return c.json({ error: 'publicStreamName already exists' }, 409)
     }
 
@@ -29,6 +33,8 @@ streams.post('/', async (c) => {
       streamKey,
       isLive: false,
     })
+
+    console.log('📺 [Streams] Stream created:', { id: doc._id, userId: doc.userId, publicStreamName: doc.publicStreamName })
 
     return c.json({
       id: doc._id,
@@ -44,7 +50,7 @@ streams.post('/', async (c) => {
       }
     }, 201)
   } catch (err) {
-    console.error('create stream error:', err)
+    console.error('📺 [Streams] create stream error:', err)
     return c.text('Server error', 500)
   }
 })
@@ -53,8 +59,15 @@ streams.post('/', async (c) => {
 streams.get('/:publicStreamName', async (c) => {
   try {
     const { publicStreamName } = c.req.param()
+    console.log('📺 [Streams] GET /api/streams/:publicStreamName:', publicStreamName)
+    
     const doc = await Stream.findOne({ publicStreamName }).lean()
-    if (!doc) return c.text('Not found', 404)
+    if (!doc) {
+      console.log('📺 [Streams] Stream not found')
+      return c.text('Not found', 404)
+    }
+    
+    console.log('📺 [Streams] Stream found:', { userId: doc.userId, isLive: doc.isLive })
     return c.json({
       userId: doc.userId,
       publicStreamName: doc.publicStreamName,
@@ -67,7 +80,7 @@ streams.get('/:publicStreamName', async (c) => {
       updatedAt: doc.updatedAt,
     })
   } catch (err) {
-    console.error('get stream error:', err)
+    console.error('📺 [Streams] get stream error:', err)
     return c.text('Server error', 500)
   }
 })

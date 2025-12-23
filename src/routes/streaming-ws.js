@@ -26,7 +26,10 @@ function initializeStreamingWebSocketServer(server) {
     const isCreator = params.isCreator === 'true' || params.role === 'publisher'
     const userAddress = (params.userAddress || '').toLowerCase()
 
+    console.log('🔌 [WS] New connection:', { tokenAddress, isCreator, userAddress })
+
     if (!tokenAddress) {
+      console.log('🔌 [WS] Closing: Missing tokenAddress')
       ws.close(1008, 'Missing tokenAddress')
       return
     }
@@ -34,20 +37,27 @@ function initializeStreamingWebSocketServer(server) {
     // Gate: Only allow publisher if userAddress matches stream.userId
     if (isCreator) {
       if (!userAddress) {
+        console.log('🔌 [WS] Closing: Missing userAddress for creator')
         ws.close(1008, 'Missing userAddress')
         return
       }
       try {
         const stream = await Stream.findOne({ publicStreamName: tokenAddress }).lean()
+        console.log('🔌 [WS] Stream lookup result:', stream ? { userId: stream.userId, publicStreamName: stream.publicStreamName } : 'not found')
+        
         if (!stream) {
+          console.log('🔌 [WS] Closing: Stream not registered')
           ws.close(1008, 'Stream not registered')
           return
         }
         if ((stream.userId || '').toLowerCase() !== userAddress) {
+          console.log('🔌 [WS] Closing: Not authorized publisher', { streamUserId: stream.userId, userAddress })
           ws.close(1008, 'Not authorized publisher')
           return
         }
+        console.log('🔌 [WS] Publisher authorized successfully')
       } catch (e) {
+        console.error('🔌 [WS] Auth check failed:', e)
         ws.close(1011, 'Auth check failed')
         return
       }
@@ -68,6 +78,18 @@ function initializeStreamingWebSocketServer(server) {
         return
       }
       room.publisher = ws
+      
+      // Update stream to isLive: true in database
+      try {
+        await Stream.findOneAndUpdate(
+          { publicStreamName: tokenAddress },
+          { isLive: true, startTime: new Date(), viewerCount: room.viewers.size }
+        )
+        console.log('🔌 [WS] Stream set to LIVE:', tokenAddress)
+      } catch (e) {
+        console.error('🔌 [WS] Failed to update stream status:', e)
+      }
+      
       // Send initial viewer count to publisher
       try { ws.send(JSON.stringify({ type: 'viewer-count', count: room.viewers.size })) } catch {}
     } else {
@@ -75,6 +97,16 @@ function initializeStreamingWebSocketServer(server) {
       const viewerId = genId()
       ws.meta.viewerId = viewerId
       room.viewers.set(viewerId, ws)
+
+      // Update viewer count in database
+      try {
+        await Stream.findOneAndUpdate(
+          { publicStreamName: tokenAddress },
+          { viewerCount: room.viewers.size }
+        )
+      } catch (e) {
+        console.error('🔌 [WS] Failed to update viewer count:', e)
+      }
 
       // Tell viewer their id
       try { ws.send(JSON.stringify({ type: 'viewer-id', viewerId })) } catch {}
@@ -147,11 +179,22 @@ function initializeStreamingWebSocketServer(server) {
       }
     })
 
-    ws.on('close', () => {
+    ws.on('close', async () => {
       const room = rooms.get(tokenAddress)
       if (!room) return
 
       if (ws.meta.role === 'publisher') {
+        // Update stream to isLive: false in database
+        try {
+          await Stream.findOneAndUpdate(
+            { publicStreamName: tokenAddress },
+            { isLive: false, endTime: new Date(), viewerCount: 0 }
+          )
+          console.log('🔌 [WS] Stream set to OFFLINE:', tokenAddress)
+        } catch (e) {
+          console.error('🔌 [WS] Failed to update stream status:', e)
+        }
+        
         // End all viewers
         for (const [vid, vws] of room.viewers.entries()) {
           try { vws.send(JSON.stringify({ type: 'publisher-ended' })) } catch {}
@@ -175,6 +218,16 @@ function initializeStreamingWebSocketServer(server) {
           if (v.readyState === 1) {
             try { v.send(countMsg) } catch {}
           }
+        }
+        
+        // Update viewer count in database
+        try {
+          await Stream.findOneAndUpdate(
+            { publicStreamName: tokenAddress },
+            { viewerCount: room.viewers.size }
+          )
+        } catch (e) {
+          console.error('🔌 [WS] Failed to update viewer count:', e)
         }
       }
 

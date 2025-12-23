@@ -27,7 +27,13 @@ connectDB();
 // Middleware
 app.use("*", logger());
 app.use("*", cors({
-  origin: ["http://localhost:3000", "http://localhost:3001", "https://dew.meme"],
+  origin: [
+    "http://localhost:3000", 
+    "http://localhost:3001", 
+    "https://dew.meme",
+    "https://www.dew.meme",
+    "https://stream.dew.meme"
+  ],
   credentials: true,
 }));
 
