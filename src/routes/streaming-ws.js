@@ -92,6 +92,14 @@ function initializeStreamingWebSocketServer(server) {
       
       // Send initial viewer count to publisher
       try { ws.send(JSON.stringify({ type: 'viewer-count', count: room.viewers.size })) } catch {}
+      
+      // If there are existing viewers waiting, request offers for them
+      for (const [existingViewerId, viewerWs] of room.viewers.entries()) {
+        if (viewerWs.readyState === 1) {
+          console.log('🔌 [WS] Requesting offer for waiting viewer:', existingViewerId)
+          try { ws.send(JSON.stringify({ type: 'request-offer', viewerId: existingViewerId })) } catch {}
+        }
+      }
     } else {
       // Assign a viewerId and notify both sides
       const viewerId = genId()
@@ -99,19 +107,24 @@ function initializeStreamingWebSocketServer(server) {
       room.viewers.set(viewerId, ws)
 
       // Update viewer count in database
+      const currentViewerCount = room.viewers.size
       try {
         await Stream.findOneAndUpdate(
           { publicStreamName: tokenAddress },
-          { viewerCount: room.viewers.size }
+          { viewerCount: currentViewerCount }
         )
       } catch (e) {
         console.error('🔌 [WS] Failed to update viewer count:', e)
       }
 
-      // Tell viewer their id
-      try { ws.send(JSON.stringify({ type: 'viewer-id', viewerId })) } catch {}
-      // Broadcast updated viewer count to room
-      const countMsg = JSON.stringify({ type: 'viewer-count', count: room.viewers.size })
+      // Tell viewer their id AND the current viewer count
+      try { 
+        ws.send(JSON.stringify({ type: 'viewer-id', viewerId }))
+        ws.send(JSON.stringify({ type: 'viewer-count', count: currentViewerCount }))
+      } catch {}
+      
+      // Broadcast updated viewer count to publisher and other viewers
+      const countMsg = JSON.stringify({ type: 'viewer-count', count: currentViewerCount })
       try {
         if (room.publisher && room.publisher.readyState === 1) {
           room.publisher.send(countMsg)
@@ -122,16 +135,31 @@ function initializeStreamingWebSocketServer(server) {
           try { v.send(countMsg) } catch {}
         }
       }
-      // Ask publisher to create offer for this viewer
-      try {
+      
+      // Ask publisher to create offer for this viewer (with retry mechanism)
+      const requestOfferFromPublisher = (attempt = 1) => {
         if (room.publisher && room.publisher.readyState === 1) {
-          room.publisher.send(JSON.stringify({ type: 'request-offer', viewerId }))
+          console.log('🔌 [WS] Requesting offer for viewer:', viewerId, 'attempt:', attempt)
+          try {
+            room.publisher.send(JSON.stringify({ type: 'request-offer', viewerId }))
+          } catch (e) {
+            console.error('🔌 [WS] Failed to send request-offer:', e)
+          }
+        } else if (attempt < 3) {
+          // Retry after a short delay (publisher might be connecting)
+          console.log('🔌 [WS] Publisher not ready, retrying in 1s... attempt:', attempt)
+          setTimeout(() => requestOfferFromPublisher(attempt + 1), 1000)
         } else {
-          // No publisher; close viewer gently
-          ws.send(JSON.stringify({ type: 'error', message: 'Publisher not available' }))
-          ws.close(1013, 'No publisher')
+          // No publisher after retries
+          console.log('🔌 [WS] No publisher available after retries')
+          try {
+            ws.send(JSON.stringify({ type: 'error', message: 'Publisher not available' }))
+            ws.send(JSON.stringify({ type: 'publisher-not-live' }))
+          } catch {}
         }
-      } catch {}
+      }
+      
+      requestOfferFromPublisher()
     }
 
     ws.on('message', (data) => {
