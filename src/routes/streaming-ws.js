@@ -1,272 +1,353 @@
-import { Hono } from 'hono'
-import { WebSocketServer } from 'ws'
-import { Stream } from '../models/Stream.js'
+/**
+ * WebSocket signaling for mediasoup SFU
+ * Handles all WebRTC signaling between clients and the SFU
+ */
 
-// Rooms: tokenAddress => { publisher: WebSocket | null, viewers: Map<viewerId, WebSocket> }
-const rooms = new Map()
+import { WebSocketServer } from 'ws';
+import { Stream } from '../models/Stream.js';
+import { getOrCreateRoom, getRoom, deleteRoom } from '../sfu/room-manager.js';
 
 function genId() {
-  return Math.random().toString(36).slice(2, 10)
+  return Math.random().toString(36).slice(2, 12);
 }
 
 function parseUrl(req) {
-  const url = new URL(req.url, `http://${req.headers.host}`)
-  const params = Object.fromEntries(url.searchParams.entries())
-  return { pathname: url.pathname, params }
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const params = Object.fromEntries(url.searchParams.entries());
+  return { pathname: url.pathname, params };
 }
 
-let wss = null
+let wss = null;
 
 function initializeStreamingWebSocketServer(server) {
-  wss = new WebSocketServer({ server, path: '/ws/stream' })
+  wss = new WebSocketServer({ server, path: '/ws/stream' });
 
   wss.on('connection', async (ws, req) => {
-    const { params } = parseUrl(req)
-    const tokenAddress = (params.tokenAddress || '').toLowerCase()
-    const isCreator = params.isCreator === 'true' || params.role === 'publisher'
-    const userAddress = (params.userAddress || '').toLowerCase()
+    const { params } = parseUrl(req);
+    const tokenAddress = (params.tokenAddress || '').toLowerCase();
+    const isCreator = params.isCreator === 'true' || params.role === 'publisher';
+    const userAddress = (params.userAddress || '').toLowerCase();
+    const peerId = genId();
 
-    console.log('🔌 [WS] New connection:', { tokenAddress, isCreator, userAddress })
+    console.log('🔌 [WS] New connection:', { tokenAddress, isCreator, userAddress, peerId });
 
     if (!tokenAddress) {
-      console.log('🔌 [WS] Closing: Missing tokenAddress')
-      ws.close(1008, 'Missing tokenAddress')
-      return
+      console.log('🔌 [WS] Closing: Missing tokenAddress');
+      ws.close(1008, 'Missing tokenAddress');
+      return;
     }
 
     // Gate: Only allow publisher if userAddress matches stream.userId
     if (isCreator) {
       if (!userAddress) {
-        console.log('🔌 [WS] Closing: Missing userAddress for creator')
-        ws.close(1008, 'Missing userAddress')
-        return
+        console.log('🔌 [WS] Closing: Missing userAddress for creator');
+        ws.close(1008, 'Missing userAddress');
+        return;
       }
       try {
-        const stream = await Stream.findOne({ publicStreamName: tokenAddress }).lean()
-        console.log('🔌 [WS] Stream lookup result:', stream ? { userId: stream.userId, publicStreamName: stream.publicStreamName } : 'not found')
+        const stream = await Stream.findOne({ publicStreamName: tokenAddress }).lean();
+        console.log('🔌 [WS] Stream lookup result:', stream ? { userId: stream.userId } : 'not found');
         
         if (!stream) {
-          console.log('🔌 [WS] Closing: Stream not registered')
-          ws.close(1008, 'Stream not registered')
-          return
+          console.log('🔌 [WS] Closing: Stream not registered');
+          ws.close(1008, 'Stream not registered');
+          return;
         }
         if ((stream.userId || '').toLowerCase() !== userAddress) {
-          console.log('🔌 [WS] Closing: Not authorized publisher', { streamUserId: stream.userId, userAddress })
-          ws.close(1008, 'Not authorized publisher')
-          return
+          console.log('🔌 [WS] Closing: Not authorized publisher');
+          ws.close(1008, 'Not authorized publisher');
+          return;
         }
-        console.log('🔌 [WS] Publisher authorized successfully')
+        console.log('🔌 [WS] Publisher authorized successfully');
       } catch (e) {
-        console.error('🔌 [WS] Auth check failed:', e)
-        ws.close(1011, 'Auth check failed')
-        return
+        console.error('🔌 [WS] Auth check failed:', e);
+        ws.close(1011, 'Auth check failed');
+        return;
       }
     }
 
-    // Attach metadata on socket
-    ws.meta = { tokenAddress, role: isCreator ? 'publisher' : 'viewer', viewerId: null }
+    // Attach metadata
+    ws.meta = { tokenAddress, role: isCreator ? 'publisher' : 'viewer', peerId, userAddress };
 
-    // Ensure room exists
-    if (!rooms.has(tokenAddress)) {
-      rooms.set(tokenAddress, { publisher: null, viewers: new Map() })
-    }
-    const room = rooms.get(tokenAddress)
-
-    if (isCreator) {
-      if (room.publisher && room.publisher.readyState === 1) {
-        ws.close(1013, 'Publisher already connected')
-        return
-      }
-      room.publisher = ws
-      
-      // Update stream to isLive: true in database
-      try {
-        await Stream.findOneAndUpdate(
-          { publicStreamName: tokenAddress },
-          { isLive: true, startTime: new Date(), viewerCount: room.viewers.size }
-        )
-        console.log('🔌 [WS] Stream set to LIVE:', tokenAddress)
-      } catch (e) {
-        console.error('🔌 [WS] Failed to update stream status:', e)
-      }
-      
-      // Send initial viewer count to publisher
-      try { ws.send(JSON.stringify({ type: 'viewer-count', count: room.viewers.size })) } catch {}
-      
-      // If there are existing viewers waiting, request offers for them
-      for (const [existingViewerId, viewerWs] of room.viewers.entries()) {
-        if (viewerWs.readyState === 1) {
-          console.log('🔌 [WS] Requesting offer for waiting viewer:', existingViewerId)
-          try { ws.send(JSON.stringify({ type: 'request-offer', viewerId: existingViewerId })) } catch {}
-        }
-      }
-    } else {
-      // Assign a viewerId and notify both sides
-      const viewerId = genId()
-      ws.meta.viewerId = viewerId
-      room.viewers.set(viewerId, ws)
-
-      // Update viewer count in database
-      const currentViewerCount = room.viewers.size
-      try {
-        await Stream.findOneAndUpdate(
-          { publicStreamName: tokenAddress },
-          { viewerCount: currentViewerCount }
-        )
-      } catch (e) {
-        console.error('🔌 [WS] Failed to update viewer count:', e)
-      }
-
-      // Tell viewer their id AND the current viewer count
-      try { 
-        ws.send(JSON.stringify({ type: 'viewer-id', viewerId }))
-        ws.send(JSON.stringify({ type: 'viewer-count', count: currentViewerCount }))
-      } catch {}
-      
-      // Broadcast updated viewer count to publisher and other viewers
-      const countMsg = JSON.stringify({ type: 'viewer-count', count: currentViewerCount })
-      try {
-        if (room.publisher && room.publisher.readyState === 1) {
-          room.publisher.send(countMsg)
-        }
-      } catch {}
-      for (const v of room.viewers.values()) {
-        if (v !== ws && v.readyState === 1) {
-          try { v.send(countMsg) } catch {}
-        }
-      }
-      
-      // Ask publisher to create offer for this viewer (with retry mechanism)
-      const requestOfferFromPublisher = (attempt = 1) => {
-        if (room.publisher && room.publisher.readyState === 1) {
-          console.log('🔌 [WS] Requesting offer for viewer:', viewerId, 'attempt:', attempt)
-          try {
-            room.publisher.send(JSON.stringify({ type: 'request-offer', viewerId }))
-          } catch (e) {
-            console.error('🔌 [WS] Failed to send request-offer:', e)
-          }
-        } else if (attempt < 3) {
-          // Retry after a short delay (publisher might be connecting)
-          console.log('🔌 [WS] Publisher not ready, retrying in 1s... attempt:', attempt)
-          setTimeout(() => requestOfferFromPublisher(attempt + 1), 1000)
-        } else {
-          // No publisher after retries
-          console.log('🔌 [WS] No publisher available after retries')
-          try {
-            ws.send(JSON.stringify({ type: 'error', message: 'Publisher not available' }))
-            ws.send(JSON.stringify({ type: 'publisher-not-live' }))
-          } catch {}
-        }
-      }
-      
-      requestOfferFromPublisher()
+    // Get or create room
+    let room;
+    try {
+      room = await getOrCreateRoom(tokenAddress);
+    } catch (e) {
+      console.error('🔌 [WS] Failed to get/create room:', e);
+      ws.close(1011, 'Failed to create room');
+      return;
     }
 
-    ws.on('message', (data) => {
-      let msg
-      try { msg = JSON.parse(data.toString()) } catch { return }
-      const { type } = msg
-      const currentRoom = rooms.get(tokenAddress)
-      if (!currentRoom) return
+    // Send initial connection info
+    try {
+      ws.send(JSON.stringify({
+        type: 'connection-success',
+        peerId,
+        role: ws.meta.role,
+        routerRtpCapabilities: room.getRouterRtpCapabilities(),
+      }));
+    } catch (e) {
+      console.error('🔌 [WS] Failed to send connection-success:', e);
+    }
 
-      // Route signaling by type
-      switch (type) {
-        case 'offer': {
-          // from publisher -> specific viewer
-          const { viewerId, offer } = msg
-          const viewer = currentRoom.viewers.get(viewerId)
-          if (viewer && viewer.readyState === 1) {
-            viewer.send(JSON.stringify({ type: 'offer', offer, viewerId }))
-          }
-          break
-        }
-        case 'answer': {
-          // from viewer -> publisher
-          const { viewerId, answer } = msg
-          const pub = currentRoom.publisher
-          if (pub && pub.readyState === 1) {
-            pub.send(JSON.stringify({ type: 'answer', answer, viewerId }))
-          }
-          break
-        }
-        case 'ice-candidate': {
-          const { viewerId, candidate, from } = msg // from: 'viewer' | 'publisher'
-          if (from === 'viewer') {
-            const pub = currentRoom.publisher
-            if (pub && pub.readyState === 1) {
-              pub.send(JSON.stringify({ type: 'ice-candidate', viewerId, candidate }))
-            }
-          } else {
-            const viewer = currentRoom.viewers.get(viewerId)
-            if (viewer && viewer.readyState === 1) {
-              viewer.send(JSON.stringify({ type: 'ice-candidate', viewerId, candidate }))
-            }
-          }
-          break
-        }
+    // Handle messages
+    ws.on('message', async (data) => {
+      let msg;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch {
+        return;
       }
-    })
 
+      const currentRoom = getRoom(tokenAddress);
+      if (!currentRoom) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Room not found' }));
+        return;
+      }
+
+      try {
+        await handleMessage(ws, currentRoom, msg);
+      } catch (e) {
+        console.error('🔌 [WS] Error handling message:', e);
+        ws.send(JSON.stringify({ type: 'error', message: e.message }));
+      }
+    });
+
+    // Handle disconnect
     ws.on('close', async () => {
-      const room = rooms.get(tokenAddress)
-      if (!room) return
+      console.log('🔌 [WS] Connection closed:', { peerId, role: ws.meta.role });
+      
+      const currentRoom = getRoom(tokenAddress);
+      if (!currentRoom) return;
 
       if (ws.meta.role === 'publisher') {
-        // Update stream to isLive: false in database
+        // Publisher left - end stream
+        currentRoom.removePublisher();
+        
+        // Update database
         try {
           await Stream.findOneAndUpdate(
             { publicStreamName: tokenAddress },
             { isLive: false, endTime: new Date(), viewerCount: 0 }
-          )
-          console.log('🔌 [WS] Stream set to OFFLINE:', tokenAddress)
+          );
+          console.log('🔌 [WS] Stream set to OFFLINE:', tokenAddress);
         } catch (e) {
-          console.error('🔌 [WS] Failed to update stream status:', e)
+          console.error('🔌 [WS] Failed to update stream status:', e);
         }
-        
-        // End all viewers
-        for (const [vid, vws] of room.viewers.entries()) {
-          try { vws.send(JSON.stringify({ type: 'publisher-ended' })) } catch {}
-          try { vws.close(1001, 'Publisher disconnected') } catch {}
-        }
-        room.viewers.clear()
-        room.publisher = null
-      } else {
-        // Remove viewer and notify publisher
-        const viewerId = ws.meta.viewerId
-        if (viewerId) room.viewers.delete(viewerId)
-        if (room.publisher && room.publisher.readyState === 1 && viewerId) {
-          try { room.publisher.send(JSON.stringify({ type: 'viewer-left', viewerId })) } catch {}
-        }
-        // Broadcast updated viewer count
-        const countMsg = JSON.stringify({ type: 'viewer-count', count: room.viewers.size })
-        try {
-          if (room.publisher && room.publisher.readyState === 1) room.publisher.send(countMsg)
-        } catch {}
-        for (const v of room.viewers.values()) {
-          if (v.readyState === 1) {
-            try { v.send(countMsg) } catch {}
+
+        // Notify all viewers
+        for (const [viewerId, viewer] of currentRoom.viewers) {
+          if (viewer.ws.readyState === 1) {
+            try {
+              viewer.ws.send(JSON.stringify({ type: 'publisher-ended' }));
+            } catch {}
           }
         }
+
+        // Clean up room if no viewers
+        if (currentRoom.getViewerCount() === 0) {
+          deleteRoom(tokenAddress);
+        }
+      } else {
+        // Viewer left
+        const remainingViewers = currentRoom.removeViewer(peerId);
         
         // Update viewer count in database
         try {
           await Stream.findOneAndUpdate(
             { publicStreamName: tokenAddress },
-            { viewerCount: room.viewers.size }
-          )
+            { viewerCount: remainingViewers }
+          );
         } catch (e) {
-          console.error('🔌 [WS] Failed to update viewer count:', e)
+          console.error('🔌 [WS] Failed to update viewer count:', e);
+        }
+
+        // Broadcast updated viewer count
+        broadcastViewerCount(currentRoom, remainingViewers);
+
+        // Clean up room if empty
+        if (!currentRoom.hasPublisher() && remainingViewers === 0) {
+          deleteRoom(tokenAddress);
         }
       }
+    });
 
-      // Cleanup room if empty
-      if (!room.publisher && room.viewers.size === 0) {
-        rooms.delete(tokenAddress)
-      }
-    })
-
-    ws.on('error', () => {})
-  })
+    ws.on('error', (e) => {
+      console.error('🔌 [WS] WebSocket error:', e);
+    });
+  });
 }
 
-export { initializeStreamingWebSocketServer }
+/**
+ * Handle incoming WebSocket messages
+ */
+async function handleMessage(ws, room, msg) {
+  const { type, requestId } = msg;
+  const peerId = ws.meta.peerId;
+  const isPublisher = ws.meta.role === 'publisher';
+
+  // Helper to send response with requestId
+  const respond = (data) => {
+    ws.send(JSON.stringify({ ...data, requestId }));
+  };
+
+  switch (type) {
+    // ===== Publisher messages =====
+    
+    case 'create-producer-transport': {
+      if (!isPublisher) throw new Error('Only publisher can create producer transport');
+      
+      const transportParams = await room.setPublisher(peerId, ws);
+      
+      // Update stream to live
+      try {
+        await Stream.findOneAndUpdate(
+          { publicStreamName: room.tokenAddress },
+          { isLive: true, startTime: new Date(), viewerCount: room.getViewerCount() }
+        );
+        console.log('🔌 [WS] Stream set to LIVE:', room.tokenAddress);
+      } catch (e) {
+        console.error('🔌 [WS] Failed to update stream status:', e);
+      }
+      
+      respond({
+        type: 'producer-transport-created',
+        params: transportParams,
+      });
+      break;
+    }
+
+    case 'connect-producer-transport': {
+      if (!isPublisher) throw new Error('Only publisher can connect producer transport');
+      
+      await room.connectProducerTransport(msg.dtlsParameters);
+      respond({ type: 'producer-transport-connected' });
+      break;
+    }
+
+    case 'produce': {
+      if (!isPublisher) throw new Error('Only publisher can produce');
+      
+      const { id } = await room.produce(msg.kind, msg.rtpParameters, msg.appData);
+      respond({
+        type: 'produced',
+        id,
+        kind: msg.kind,
+      });
+      
+      // Send current viewer count to publisher (no requestId for this)
+      ws.send(JSON.stringify({
+        type: 'viewer-count',
+        count: room.getViewerCount(),
+      }));
+      break;
+    }
+
+    // ===== Viewer messages =====
+
+    case 'create-consumer-transport': {
+      if (isPublisher) throw new Error('Publisher should not create consumer transport');
+      
+      const transportParams = await room.addViewer(peerId, ws);
+      
+      // Update viewer count
+      const viewerCount = room.getViewerCount();
+      try {
+        await Stream.findOneAndUpdate(
+          { publicStreamName: room.tokenAddress },
+          { viewerCount }
+        );
+      } catch (e) {
+        console.error('🔌 [WS] Failed to update viewer count:', e);
+      }
+      
+      // Broadcast viewer count
+      broadcastViewerCount(room, viewerCount);
+      
+      respond({
+        type: 'consumer-transport-created',
+        params: transportParams,
+      });
+      
+      // Send available producers (no requestId - this is a push notification)
+      const producers = room.getProducerIds();
+      if (producers.length > 0) {
+        ws.send(JSON.stringify({
+          type: 'producers-available',
+          producers,
+        }));
+      } else {
+        ws.send(JSON.stringify({ type: 'publisher-not-live' }));
+      }
+      break;
+    }
+
+    case 'connect-consumer-transport': {
+      if (isPublisher) throw new Error('Publisher should not connect consumer transport');
+      
+      await room.connectConsumerTransport(peerId, msg.dtlsParameters);
+      respond({ type: 'consumer-transport-connected' });
+      break;
+    }
+
+    case 'consume': {
+      if (isPublisher) throw new Error('Publisher should not consume');
+      
+      const consumerParams = await room.consume(peerId, msg.producerId, msg.rtpCapabilities);
+      respond({
+        type: 'consumed',
+        ...consumerParams,
+      });
+      break;
+    }
+
+    case 'resume-consumer': {
+      if (isPublisher) throw new Error('Publisher should not resume consumer');
+      
+      await room.resumeConsumer(peerId, msg.consumerId);
+      respond({ type: 'consumer-resumed', consumerId: msg.consumerId });
+      break;
+    }
+
+    // ===== Common messages =====
+
+    case 'get-producers': {
+      const producers = room.getProducerIds();
+      respond({
+        type: 'producers-available',
+        producers,
+      });
+      break;
+    }
+
+    case 'ping': {
+      respond({ type: 'pong' });
+      break;
+    }
+
+    default:
+      console.log('🔌 [WS] Unknown message type:', type);
+  }
+}
+
+/**
+ * Broadcast viewer count to all connected clients in a room
+ */
+function broadcastViewerCount(room, count) {
+  const msg = JSON.stringify({ type: 'viewer-count', count });
+  
+  // Send to publisher
+  if (room.publisher && room.publisher.ws.readyState === 1) {
+    try { room.publisher.ws.send(msg); } catch {}
+  }
+  
+  // Send to all viewers
+  for (const viewer of room.viewers.values()) {
+    if (viewer.ws.readyState === 1) {
+      try { viewer.ws.send(msg); } catch {}
+    }
+  }
+}
+
+export { initializeStreamingWebSocketServer };

@@ -10,6 +10,7 @@ import webhooksRoutes from "./routes/webhooks.js";
 import streamStatusRoutes from "./routes/stream-status.js";
 import streamsRoutes from "./routes/streams.js";
 import { initializeStreamingWebSocketServer } from "./routes/streaming-ws.js";
+import { initializeWorkers } from "./sfu/mediasoup-config.js";
 
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -50,9 +51,25 @@ app.get("/health", (c) => c.json({ status: "OK", ts: new Date().toISOString() })
 app.use("*", errorHandler);
 
 const port = process.env.PORT || 8787;
-console.log(`dew-streaming-service running on :${port}`);
 
-const server = serve({ fetch: app.fetch, port });
+async function start() {
+  try {
+    // Initialize mediasoup workers before starting server
+    console.log('🎬 [Server] Initializing mediasoup SFU...');
+    await initializeWorkers();
+    console.log('🎬 [Server] mediasoup SFU initialized');
 
-// Initialize WebRTC signaling WebSocket
-initializeStreamingWebSocketServer(server);
+    // Start HTTP server
+    const server = serve({ fetch: app.fetch, port });
+    console.log(`🚀 dew-streaming-service running on :${port}`);
+
+    // Initialize WebSocket signaling
+    initializeStreamingWebSocketServer(server);
+    console.log('🔌 [Server] WebSocket signaling server initialized');
+  } catch (error) {
+    console.error('❌ [Server] Failed to start:', error);
+    process.exit(1);
+  }
+}
+
+start();
